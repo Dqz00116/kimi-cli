@@ -935,15 +935,91 @@ class KimiSoul:
         await self._context.append_message(tool_messages)
         # token count of tool results are not available yet
 
+    async def _compact_with_memory(self, memory_content: str) -> CompactionResult:
+        """Compact using pre-built memory (zero LLM cost)."""
+        from kosong.message import Message
+        
+        # Build compacted messages using memory
+        compacted_message = Message(
+            role="user",
+            content=[
+                system("Previous context has been compacted. Session memory summary:"),
+                TextPart(text=memory_content),
+            ],
+        )
+        
+        # Estimate tokens
+        estimated_tokens = estimate_text_tokens([compacted_message])
+        
+        return CompactionResult(
+            messages=[compacted_message],
+            usage=None,
+        )
+
     async def compact_context(self, custom_instruction: str = "") -> None:
         """
         Compact the context.
+
+        Uses memory-based compaction when available (zero LLM cost),
+        falls back to LLM-based compaction otherwise.
 
         Raises:
             LLMNotSet: When the LLM is not set.
             ChatProviderError: When the chat provider returns an error.
         """
+        # Try memory-based compaction first (if no custom instruction)
+        if not custom_instruction and self._memory_service:
+            try:
+                memory_content = await self._memory_service.get_memory_for_compaction()
+                if memory_content:
+                    logger.info("Using memory-based compaction (zero LLM cost)")
+                    
+                    trigger_reason = "memory"
+                    from kimi_cli.hooks import events
+                    
+                    await self._hook_engine.trigger(
+                        "PreCompact",
+                        matcher_value=trigger_reason,
+                        input_data=events.pre_compact(
+                            session_id=self._runtime.session.id,
+                            cwd=str(Path.cwd()),
+                            trigger=trigger_reason,
+                            token_count=self._context.token_count,
+                        ),
+                    )
+                    
+                    wire_send(CompactionBegin())
+                    compaction_result = await self._compact_with_memory(memory_content)
+                    
+                    await self._context.clear()
+                    await self._context.write_system_prompt(self._agent.system_prompt)
+                    await self._checkpoint()
+                    await self._context.append_message(compaction_result.messages)
+                    estimated_token_count = compaction_result.estimated_token_count
+                    
+                    if self._runtime.role == "root":
+                        active_task_snapshot = build_active_task_snapshot(self._runtime.background_tasks)
+                        if active_task_snapshot is not None:
+                            active_task_message = Message(
+                                role="user",
+                                content=[
+                                    system(
+                                        "The following background tasks are still active after compaction. "
+                                        "Use TaskList if you need to re-enumerate them later."
+                                    ),
+                                    TextPart(text=active_task_snapshot),
+                                ],
+                            )
+                            await self._context.append_message(active_task_message)
+                            estimated_token_count += estimate_text_tokens([active_task_message])
+                    
+                    await self._context.update_token_count(estimated_token_count)
+                    wire_send(CompactionEnd())
+                    return
+            except Exception as e:
+                logger.warning(f"Memory-based compaction failed, falling back to LLM: {e}")
 
+        # Fall back to LLM-based compaction
         chat_provider = self._runtime.llm.chat_provider if self._runtime.llm is not None else None
 
         async def _run_compaction_once() -> CompactionResult:
