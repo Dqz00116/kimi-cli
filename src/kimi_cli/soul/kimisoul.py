@@ -52,6 +52,7 @@ from kimi_cli.soul.compaction import (
     estimate_text_tokens,
     should_auto_compact,
 )
+from kimi_cli.soul.memory.service import MemoryCompactionService
 from kimi_cli.soul.context import Context
 from kimi_cli.soul.dynamic_injection import (
     DynamicInjection,
@@ -137,6 +138,7 @@ class KimiSoul:
         self._context = context
         self._loop_control = agent.runtime.config.loop_control
         self._compaction = SimpleCompaction()  # TODO: maybe configurable and composable
+        self._memory_service = MemoryCompactionService(agent.runtime.session)
 
         for tool in agent.toolset.tools:
             if tool.name == SendDMail_NAME:
@@ -818,6 +820,35 @@ class KimiSoul:
         results = await result.tool_results()
         logger.debug("Got tool results: {results}", results=results)
 
+        # Capture tool use and file edit events for memory service
+        if self._memory_service:
+            for tool_result in results:
+                try:
+                    tool_name = tool_result.tool_name
+                    params = tool_result.params or {}
+                    result_data = {"success": tool_result.success}
+                    if tool_result.return_value is not None:
+                        result_data["return_value"] = str(tool_result.return_value)
+                    
+                    # Record tool use
+                    self._memory_service.on_tool_use(
+                        tool_name=tool_name,
+                        params=params,
+                        result=result_data
+                    )
+                    
+                    # Record file edit for file-related tools
+                    if tool_name in ("WriteFile", "StrReplaceFile"):
+                        file_path = params.get("path") or params.get("file_path")
+                        content = params.get("content") or params.get("new") or ""
+                        if file_path:
+                            self._memory_service.on_file_edit(
+                                path=file_path,
+                                content=content
+                            )
+                except Exception:
+                    logger.warning("Memory service event capture failed", exc_info=True)
+
         # If a tool (EnterPlanMode/ExitPlanMode) changed plan mode during execution,
         # send a corrected StatusUpdate so the client sees the up-to-date state.
         if self._plan_mode != plan_mode_before_tools:
@@ -867,6 +898,15 @@ class KimiSoul:
                     )
                 ],
             )
+
+        # Trigger memory extraction after step complete
+        if self._memory_service:
+            try:
+                self._memory_service.on_step_complete(
+                    current_tokens=self._context.token_count
+                )
+            except Exception:
+                logger.warning("Memory service on_step_complete failed", exc_info=True)
 
         if result.tool_calls:
             return None
